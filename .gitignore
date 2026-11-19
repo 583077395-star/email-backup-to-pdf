@@ -1,0 +1,13 @@
+# 临时产物
+.work/
+__pycache__/
+*.py[cod]
+
+# 转换结果（勿入库）
+PDF/
+附件/
+索引.csv
+
+# 系统
+.DS_Store
+Thumbs.db
