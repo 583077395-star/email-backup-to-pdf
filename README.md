@@ -75,4 +75,4 @@ python scripts/qa_pdfs.py --out "./邮箱备份_PDF"
 
 ## 许可
 
-未指定。如需开源，建议在此处补充 LICENSE（如 MIT）。
+本项目采用 [MIT License](LICENSE) 开源。
