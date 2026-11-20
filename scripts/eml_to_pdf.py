@@ -7,8 +7,10 @@
 
 行为：
   * 自动识别 zip 分卷；遇到未下载完整/损坏的分卷直接报错退出（不生成残缺文件）。
-  * 已存在 索引.csv 时默认增量：跳过已转换过的分卷，文件名去重，索引用追加模式。
-  * 输出：<out>/PDF/*.pdf  <out>/附件/<PDF同名>/*  <out>/索引.csv
+  * 已存在 索引.csv 时默认增量：按 (来源包, 原件名) 判断哪一封已转过，
+    重跑同一命令只补缺失的邮件；失败明细写入 失败清单.csv。
+  * 默认剥离邮件里的远程图片/外链资源（--allow-remote 可关闭），避免打印时回连泄露已读状态。
+  * 输出：<out>/PDF/*.pdf  <out>/附件/<PDF同名>/*  <out>/索引.csv  <out>/失败清单.csv
 """
 import argparse
 import base64
@@ -21,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import zipfile
+from datetime import datetime
 from email import policy
 from email.utils import parsedate_to_datetime
 
@@ -77,6 +80,18 @@ def clean_body(content):
     return content
 
 
+def strip_remote(content):
+    """剥离指向外部主机的图片与背景资源，只保留 cid: / data: 内联资源。
+
+    headless 打印等于把邮件真打开一次：企业邮件里的跟踪像素会回连发件方
+    服务器，把「已读」时间和 IP 暴露出去。默认关掉远程资源。
+    """
+    content = re.sub(r'(?i)(src\s*=\s*)(["\'])\s*(?:https?:)?//[^"\']*\2', r'\1\2""\2', content)
+    content = re.sub(r'(?i)url\(\s*(["\']?)\s*(?:https?:)?//[^)]*\)', 'none', content)
+    content = re.sub(r'(?i)(background\s*=\s*)(["\'])\s*(?:https?:)?//[^"\']*\2', r'\1\2""\2', content)
+    return content
+
+
 def decode_name(raw):
     """zip 内中文名按 cp936 还原。"""
     try:
@@ -85,7 +100,7 @@ def decode_name(raw):
         return raw
 
 
-def build_html(msg, orig_name, att_list, date_fmt):
+def build_html(msg, orig_name, att_list, date_fmt, allow_remote=False):
     subject = str(msg.get("Subject") or "")
     sender = str(msg.get("From") or "")
     to = str(msg.get("To") or "")
@@ -117,6 +132,8 @@ def build_html(msg, orig_name, att_list, date_fmt):
 
     content = re.sub(r"\son\w+\s*=\s*\"[^\"]*\"", "", content, flags=re.I)
     content = clean_body(content)
+    if not allow_remote:
+        content = strip_remote(content)
 
     att_html = ""
     if att_list:
@@ -162,7 +179,13 @@ def print_pdf(browser, html_path, pdf_path, profile):
     url = Path(os.path.abspath(html_path)).as_uri()
     cmd = [browser, "--headless=new", "--disable-gpu", "--no-pdf-header-footer",
            "--user-data-dir=" + profile, "--print-to-pdf=" + pdf_path, url]
-    subprocess.run(cmd, capture_output=True, timeout=300)
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=300)
+    except Exception as e:
+        print("浏览器调用失败：%s" % e, flush=True)
+        if os.path.exists(pdf_path):
+            os.remove(pdf_path)
+        return False
     if not os.path.exists(pdf_path):
         return False
     with open(pdf_path, "rb") as f:
@@ -182,17 +205,24 @@ def open_zip(path):
 
 
 def load_index(path):
-    rows, stems, keys, pkgs = [], set(), set(), set()
+    """读取已有索引。
+
+    返回 (rows, used, done)：
+      used —— 已占用的 PDF 文件名（不含扩展名），用于避免重名覆盖
+      done —— 已成功转换的 (来源包, 原件名)，用于按「邮件」粒度续跑
+    判重以原件身份为准，不能用 (邮件时间, 主题)：同一天的同名主题（日报、
+    系统通知）是不同邮件，按主题判重会把后一封丢掉。
+    """
+    rows, used, done = [], set(), set()
     if os.path.exists(path):
         with open(path, encoding="utf-8-sig") as f:
             for r in csv.DictReader(f):
                 rows.append(r)
-                if r.get("来源包"):
-                    pkgs.add(r["来源包"])
                 if r.get("PDF文件"):
-                    stems.add(r["PDF文件"][:-4])
-                keys.add((r.get("邮件时间", ""), r.get("主题", "")))
-    return rows, stems, keys, pkgs
+                    used.add(r["PDF文件"][:-4])
+                if r.get("原件名"):
+                    done.add((r.get("来源包", ""), r["原件名"]))
+    return rows, used, done
 
 
 def main():
@@ -206,6 +236,8 @@ def main():
     ap.add_argument("--edge", default=None)
     ap.add_argument("--fresh", action="store_true", help="忽略已有索引，全部重转")
     ap.add_argument("--keep-work", action="store_true", help="保留临时 html/浏览器 profile")
+    ap.add_argument("--allow-remote", action="store_true",
+                    help="允许 PDF 加载邮件里的远程图片/外链资源（默认剥离，避免回连泄露已读状态）")
     args = ap.parse_args()
 
     pdf_dir = os.path.join(args.out, "PDF")
@@ -220,12 +252,14 @@ def main():
         os.remove(index_path)
 
     browser = find_browser(args.edge)
-    rows, used, seen, done_pkgs = load_index(index_path)
+    rows, used, done = load_index(index_path)
     if args.fresh:
-        rows, used, seen, done_pkgs = [], set(), set(), set()
+        rows, used, done = [], set(), set()
     header_written = os.path.exists(index_path)
     seq = len(rows)
     added = skipped = failed = 0
+    fail_path = os.path.join(args.out, "失败清单.csv")
+    fails = []
 
     zips = sorted(f for f in os.listdir(args.zip_dir) if f.lower().endswith(".zip"))
     if not zips:
@@ -236,9 +270,6 @@ def main():
         if not header_written:
             w.writerow(["序号", "邮件时间", "主题", "发件人", "收件人", "PDF文件", "附件数", "来源包", "原件名"])
         for zp in zips:
-            if zp in done_pkgs:
-                print("跳过已处理分卷：%s" % zp, flush=True)
-                continue
             zpath = os.path.join(args.zip_dir, zp)
             z = open_zip(zpath)
             with z:
@@ -246,17 +277,16 @@ def main():
                     if args.limit and added >= args.limit:
                         break
                     orig = decode_name(info.filename)
+                    if (zp, orig) in done:
+                        skipped += 1
+                        continue
                     raw = z.read(info)
                     try:
                         msg = email.message_from_bytes(raw, policy=policy.default)
                         att = [p.get_filename() for p in msg.walk()
                                if p.get_filename() and not (p.get("Content-ID") and p.get_content_maintype() == "image")]
-                        ts, date_str, subject, doc = build_html(msg, orig, att, args.date_format)
-
-                        if (date_str, subject) in seen:
-                            skipped += 1
-                            print("SKIP 重复：%s %s" % (date_str, subject), flush=True)
-                            continue
+                        ts, date_str, subject, doc = build_html(msg, orig, att, args.date_format,
+                                                                 allow_remote=args.allow_remote)
 
                         base = "%s_%s" % (ts, sanitize(subject))
                         stem, n = base, 2
@@ -264,7 +294,6 @@ def main():
                             stem = "%s_%d" % (base, n)
                             n += 1
                         used.add(stem)
-                        seen.add((date_str, subject))
 
                         if args.att_mode != "none":
                             for p in msg.walk():
@@ -300,19 +329,34 @@ def main():
                             w.writerow([seq, date_str, subject, str(msg.get("From") or ""),
                                         str(msg.get("To") or ""), stem + ".pdf", len(att), zp, orig])
                             idx.flush()
+                            done.add((zp, orig))
                             print("[%d] OK %s att=%d" % (seq, stem, len(att)), flush=True)
                         else:
                             failed += 1
+                            fails.append((zp, orig, "渲染失败：未产出有效 PDF（文件头不是 %PDF-）"))
                             print("FAIL 渲染失败：%s" % stem, flush=True)
                     except Exception as e:
                         failed += 1
+                        fails.append((zp, orig, "%s: %s" % (type(e).__name__, e)))
                         print("ERR %s: %s" % (orig, e), flush=True)
 
     if not args.keep_work:
         import shutil
         shutil.rmtree(work, ignore_errors=True)
 
-    print("\n完成：新增 %d，跳过重复 %d，失败 %d；输出目录 %s" % (added, skipped, failed, args.out))
+    if fails:
+        new = not os.path.exists(fail_path)
+        with open(fail_path, "a", encoding="utf-8-sig", newline="") as ff:
+            fw = csv.writer(ff)
+            if new:
+                fw.writerow(["时间", "来源包", "原件名", "原因"])
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            for zp, orig, why in fails:
+                fw.writerow([stamp, zp, orig, why])
+
+    print("\n完成：新增 %d，跳过已完成 %d，失败 %d；输出目录 %s" % (added, skipped, failed, args.out))
+    if fails:
+        print("失败明细见 %s（修好后重跑同一命令即可补齐，已成功的不会重做）" % fail_path)
     if failed:
         sys.exit(1)
 

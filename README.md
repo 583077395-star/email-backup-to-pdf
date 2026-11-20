@@ -10,7 +10,9 @@ An agent skill that turns a mailbox export (`.eml` files, often split into `mess
 - 每封邮件 → 一个 A4 PDF：抬头（发件人/收件人/抄送/时间）+ 正文 + 内嵌图片 + 附件清单
 - 附件按「与 PDF 同名」的子目录集中归档，可选与 PDF 同目录或不导出
 - 生成 `索引.csv`：序号、邮件时间、主题、发件人、收件人、PDF 文件、附件数、来源包、原件名
-- **增量**：重复执行同一命令即可补转后新增的分卷，已处理分卷跳过、重名自动加后缀、索引只追加
+- **增量**：重复执行同一命令即可补转新增分卷与上次失败的邮件。判重按「(来源包, 原件名)」，中途失败、`--limit` 只跑一部分都能续上，已成功的不重做
+- **失败可见**：渲染失败/异常的邮件逐条写入 `失败清单.csv`（来源包、原件名、原因），修好后重跑即补齐
+- **隐私保护**：默认剥离邮件中的远程图片与外部 CSS 资源，避免 headless 打印时回连发件方、泄露「已读」状态（确需保留时加 `--allow-remote`）
 - 自带体检脚本，交付前查空首页、打不开的 PDF、附件缺失
 
 ## 安装
@@ -22,8 +24,12 @@ An agent skill that turns a mailbox export (`.eml` files, often split into `mess
 #    Claude 生态 : ~/.claude/skills/
 #    通用        : <workspace>/.user_skills/
 
-# 2) 用 skills CLI 安装
+# 2) 用 skills CLI 安装（需要 node/npx）
 npx skills add <owner>/<repo>@email-backup-to-pdf
+
+# 3) 没有 node：直接下载 Release 里的 zip
+#    https://github.com/583077395-star/email-backup-to-pdf/releases
+#    解压后把 email-backup-to-pdf-<version> 文件夹放进上面任一个技能目录
 ```
 
 ## 依赖
@@ -40,16 +46,17 @@ npx skills add <owner>/<repo>@email-backup-to-pdf
 # 全量
 python scripts/eml_to_pdf.py --zip-dir "./邮箱备份" --out "./邮箱备份_PDF"
 
-# 增量（补转后新增的分卷，直接重跑）
+# 增量（补转新增分卷/上次失败的邮件，直接重跑）
 python scripts/eml_to_pdf.py --zip-dir "./邮箱备份" --out "./邮箱备份_PDF"
 
-# 先小批量验证版面
+# 先小批量验证版面（之后记得再跑一次全量，否则剩余邮件不会补上）
 python scripts/eml_to_pdf.py --zip-dir "./邮箱备份" --out "/tmp/test" --limit 3
 
 # 可选参数
 --date-format "%Y%m%d_%H%M"           # 文件名时间格式
 --att-mode collection|per-mail|none   # 附件策略
 --fresh                               # 忽略已有索引，全部重转
+--allow-remote                        # 保留邮件中的远程图片（默认剥离）
 ```
 
 体检：
@@ -64,8 +71,17 @@ python scripts/qa_pdfs.py --out "./邮箱备份_PDF"
 <out>/
 ├── PDF/YYYYMMDD_HHMM_主题.pdf
 ├── 附件/<与 PDF 同名的目录>/<原始附件>
-└── 索引.csv
+├── 索引.csv
+└── 失败清单.csv      # 仅在出现失败时生成：时间, 来源包, 原件名, 原因
 ```
+
+## 增量与重跑语义
+
+判重键是 **（来源包, 原件名）**，不是（邮件时间, 主题）。这样：
+
+- 同一天收到两封同名主题的邮件（日报、系统通知）都会各自成一份 PDF，不会互相覆盖或被当成重复丢弃
+- 中途失败、中途 Ctrl-C、`--limit` 只跑了几封，重跑同一条命令都会把缺的补齐
+- 文件名冲突仍用 `_2`、`_3` 兜底，索引只追加不重写（序号连续）
 
 ## 为什么不用 Word 转 PDF
 
